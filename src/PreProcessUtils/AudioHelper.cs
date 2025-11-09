@@ -1,4 +1,11 @@
-﻿using NAudio.Wave;
+﻿using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.ComponentModel;
+using System.IO;
+using System.Runtime.InteropServices;
+using NAudio.Wave;
+using NAudio.Wave.SampleProviders;
 using System.Diagnostics;
 
 /// <summary>
@@ -11,30 +18,35 @@ namespace PreProcessUtils
     {
         public static float[] GetFileSample(string wavFilePath, ref TimeSpan duration)
         {
-            if (!File.Exists(wavFilePath))
+            float[][] channels = GetFileChannelSamples(wavFilePath, ref duration);
+            if (channels.Length == 0)
             {
-                return new float[1];
+                return Array.Empty<float>();
             }
-            AudioFileReader audioFileReader = new AudioFileReader(wavFilePath);
-            int sampleRate = audioFileReader.WaveFormat.SampleRate;
-            int sourceChannels = audioFileReader.WaveFormat.Channels;
-            int bitsPerSample = audioFileReader.WaveFormat.BitsPerSample;
-            byte[] datas = new byte[audioFileReader.Length];            
-#if NET472_OR_GREATER
-            audioFileReader.Read(datas, 0, datas.Length);
-#endif
-#if NET6_0_OR_GREATER
-            audioFileReader.ReadExactly(datas);
-            //audioFileReader.ReadExactly(datas, 0, datas.Length);
-#endif
-            duration = audioFileReader.TotalTime;
-            float[] wavsdata = new float[datas.Length / sizeof(float)];
-            Buffer.BlockCopy(datas, 0, wavsdata, 0, datas.Length);
-            if (sampleRate != 16000 || sourceChannels != 1)
+
+            if (channels.Length == 1)
             {
-                wavsdata = Resample(wavsdata, sampleRate, 16000, sourceChannels: sourceChannels);
+                return channels[0];
             }
-            return wavsdata;
+
+            int length = channels.Max(channel => channel.Length);
+            float[] mixed = new float[length];
+            for (int ch = 0; ch < channels.Length; ch++)
+            {
+                float[] channel = channels[ch];
+                int limit = Math.Min(length, channel.Length);
+                for (int i = 0; i < limit; i++)
+                {
+                    mixed[i] += channel[i];
+                }
+            }
+
+            float inv = 1f / channels.Length;
+            for (int i = 0; i < length; i++)
+            {
+                mixed[i] *= inv;
+            }
+            return mixed;
         }
 
         /// <summary>
@@ -89,26 +101,17 @@ namespace PreProcessUtils
             if (!File.Exists(wavFilePath))
             {
                 Trace.Assert(File.Exists(wavFilePath), "file does not exist:" + wavFilePath);
-                wavdatas.Add(new float[1]);
+                wavdatas.Add(Array.Empty<float>());
                 return wavdatas;
             }
-            AudioFileReader audioFileReader = new AudioFileReader(wavFilePath);
-            int sampleRate = audioFileReader.WaveFormat.SampleRate;
-            int sourceChannels = audioFileReader.WaveFormat.Channels;
-            byte[] datas = new byte[audioFileReader.Length];
-#if NET472_OR_GREATER
-            audioFileReader.Read(datas, 0, datas.Length);
-#endif
-#if NET6_0_OR_GREATER
-            audioFileReader.ReadExactly(datas);
-#endif
-            duration = audioFileReader.TotalTime;
-            float[] wavsdata = new float[datas.Length / sizeof(float)];
-            Buffer.BlockCopy(datas, 0, wavsdata, 0, datas.Length);
-            if (sampleRate != 16000)
+
+            float[] wavsdata = GetFileSample(wavFilePath, ref duration);
+            if (wavsdata.Length == 0)
             {
-                wavsdata = Resample(wavsdata, sampleRate, 16000, sourceChannels: sourceChannels);
+                wavdatas.Add(Array.Empty<float>());
+                return wavdatas;
             }
+
             int wavsLength = wavsdata.Length;
             int chunkNum = (int)Math.Ceiling((double)wavsLength / chunkSize);
             for (int i = 0; i < chunkNum; i++)
@@ -183,6 +186,183 @@ namespace PreProcessUtils
             duration = durations.Aggregate(TimeSpan.Zero, (currentTotal, nextDuration) => currentTotal + nextDuration);
             return wavdatas;
         }
+
+        public static float[][] GetFileChannelSamples(string wavFilePath, ref TimeSpan duration)
+        {
+            if (!File.Exists(wavFilePath))
+            {
+                return Array.Empty<float[]>();
+            }
+
+            if (IsWindows())
+            {
+                return LoadWithAudioFileReader(wavFilePath, ref duration);
+            }
+
+            try
+            {
+                return LoadWithWaveFileReader(wavFilePath, ref duration);
+            }
+            catch (Exception ex) when (ex is InvalidOperationException or FormatException or NotSupportedException)
+            {
+                return LoadWithFfmpegFallback(wavFilePath, ref duration, ex);
+            }
+        }
+
+        private static float[][] LoadWithAudioFileReader(string filePath, ref TimeSpan duration)
+        {
+            using var reader = new AudioFileReader(filePath);
+            return ReadChannelsFromProvider(reader.ToSampleProvider(), ref duration);
+        }
+
+        private static float[][] LoadWithWaveFileReader(string filePath, ref TimeSpan duration)
+        {
+            try
+            {
+                using var reader = new WaveFileReader(filePath);
+                if (reader.WaveFormat.Encoding != WaveFormatEncoding.Pcm &&
+                    reader.WaveFormat.Encoding != WaveFormatEncoding.IeeeFloat)
+                {
+                    throw new InvalidOperationException($"不支持的 WAV 编码：{reader.WaveFormat.Encoding}");
+                }
+
+                return ReadChannelsFromProvider(reader.ToSampleProvider(), ref duration);
+            }
+            catch (InvalidOperationException) when (IsWindows())
+            {
+                return LoadWithAudioFileReader(filePath, ref duration);
+            }
+        }
+
+        private static float[][] LoadWithFfmpegFallback(string filePath, ref TimeSpan duration, Exception originalException)
+        {
+            string tempDirectory = Path.Combine(Path.GetTempPath(), "ManySpeech", Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(tempDirectory);
+            string tempOutput = Path.Combine(tempDirectory, "converted.wav");
+
+            try
+            {
+                string arguments =
+                    "-y " +
+                    $"-i \"{filePath}\" " +
+                    "-ar 16000 " +
+                    "-sample_fmt s16 " +
+                    $"\"{tempOutput}\"";
+
+                var startInfo = new ProcessStartInfo
+                {
+                    FileName = "ffmpeg",
+                    Arguments = arguments,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    UseShellExecute = false,
+                    CreateNoWindow = true
+                };
+
+                using Process? process = Process.Start(startInfo);
+                if (process == null)
+                {
+                    throw new InvalidOperationException("无法启动 ffmpeg 进程。", originalException);
+                }
+
+                string stdErr = process.StandardError.ReadToEnd();
+                process.WaitForExit();
+
+                if (process.ExitCode != 0 || !File.Exists(tempOutput))
+                {
+                    throw new InvalidOperationException(
+                        $"ffmpeg 转码失败，退出代码 {process.ExitCode}。错误信息：{stdErr}",
+                        originalException);
+                }
+
+                return LoadWithWaveFileReader(tempOutput, ref duration);
+            }
+            catch (Win32Exception win32Ex)
+            {
+                throw new InvalidOperationException(
+                    "执行 ffmpeg 失败，请确认已安装并在 PATH 中可用。",
+                    new AggregateException(originalException, win32Ex));
+            }
+            finally
+            {
+                try
+                {
+                    if (File.Exists(tempOutput))
+                    {
+                        File.Delete(tempOutput);
+                    }
+                    if (Directory.Exists(tempDirectory))
+                    {
+                        Directory.Delete(tempDirectory, recursive: true);
+                    }
+                }
+                catch
+                {
+                    // 忽略清理失败
+                }
+            }
+        }
+
+        private static float[][] ReadChannelsFromProvider(ISampleProvider provider, ref TimeSpan duration)
+        {
+            int channels = provider.WaveFormat.Channels;
+            if (channels <= 0)
+            {
+                channels = 1;
+            }
+
+            ISampleProvider resampledProvider = provider.WaveFormat.SampleRate == 16000
+                ? provider
+                : new WdlResamplingSampleProvider(provider, 16000);
+
+            var channelBuffers = new List<float>[channels];
+            for (int i = 0; i < channels; i++)
+            {
+                channelBuffers[i] = new List<float>();
+            }
+
+            int sampleRate = resampledProvider.WaveFormat.SampleRate;
+            float[] buffer = new float[sampleRate * channels];
+            int read;
+            while ((read = resampledProvider.Read(buffer, 0, buffer.Length)) > 0)
+            {
+                int frames = read / channels;
+                for (int frame = 0; frame < frames; frame++)
+                {
+                    int baseIndex = frame * channels;
+                    for (int ch = 0; ch < channels; ch++)
+                    {
+                        channelBuffers[ch].Add(buffer[baseIndex + ch]);
+                    }
+                }
+
+                int remainder = read % channels;
+                if (remainder > 0)
+                {
+                    int startIndex = read - remainder;
+                    for (int ch = 0; ch < remainder; ch++)
+                    {
+                        channelBuffers[ch].Add(buffer[startIndex + ch]);
+                    }
+                }
+            }
+
+            float[][] result = new float[channels][];
+            int maxLength = 0;
+            for (int ch = 0; ch < channels; ch++)
+            {
+                float[] channelData = channelBuffers[ch].ToArray();
+                result[ch] = channelData;
+                if (channelData.Length > maxLength)
+                {
+                    maxLength = channelData.Length;
+                }
+            }
+
+            duration = TimeSpan.FromSeconds(maxLength / 16000.0);
+            return result;
+        }
+
         /// <summary>
         /// Resamples audio sample rate
         /// </summary>
@@ -406,6 +586,11 @@ namespace PreProcessUtils
                 return isRiff && isAvi;
             }
             return false;
+        }
+
+        private static bool IsWindows()
+        {
+            return RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
         }
     }
 }

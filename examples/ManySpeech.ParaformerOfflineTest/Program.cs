@@ -7,84 +7,125 @@ using System.Diagnostics;
 using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Text;
 
 namespace ManySpeech.ParaformerOfflineTest;
 
 internal static class Program
 {
-    private static class AppConfiguration
+    private static readonly ModelConfiguration[] ModelConfigurations =
     {
-        public const string ModelType = "paraformer";
-        public const string ModelDirectory = "/ModelFiles/ASR/paraformer-large-zh-en-onnx-offline";
-        public const string Accuracy = "int8";
-        public const int Threads = 2;
-    }
-
-    private static readonly string[] SupportedModels = new[]
-    {
-        "paraformer",
-        "sensevoicesmall",
-        "seacoparaformer"
+        new(
+            Key: "paraformer",
+            DisplayName: "Paraformer 通用离线",
+            ModelType: "paraformer",
+            ModelDirectory: "/ModelFiles/ASR/paraformer-large-zh-en-onnx-offline",
+            Accuracy: "int8",
+            Threads: 2,
+            EnableItn: false,
+            EnablePunctuation: false),
+        new(
+            Key: "sensevoicesmall",
+            DisplayName: "SenseVoice Small",
+            ModelType: "sensevoicesmall",
+            ModelDirectory: "/ModelFiles/ASR/sensevoice-small-onnx",
+            Accuracy: "int8",
+            Threads: 2,
+            EnableItn: true,
+            EnablePunctuation: true),
+        new(
+            Key: "seacoparaformer",
+            DisplayName: "Paraformer Seaco 热词",
+            ModelType: "seacoparaformer",
+            ModelDirectory: "/ModelFiles/ASR/paraformer-seaco-large-zh-timestamp-onnx-offline",
+            Accuracy: "int8",
+            Threads: 2,
+            EnableItn: false,
+            EnablePunctuation: false)
     };
 
     public static int Main(string[] args)
     {
+        IReadOnlyList<ModelEntry> modelEntries = Array.Empty<ModelEntry>();
         try
         {
-            ValidateModelConfiguration();
-
-            var fileSet = ModelFileResolver.Resolve(
-                AppConfiguration.ModelDirectory,
-                AppConfiguration.ModelType,
-                AppConfiguration.Accuracy);
-
-            Console.WriteLine("=== 模型初始化 ===");
-            Console.WriteLine($"模型目录：{fileSet.ModelDirectory}");
-            Console.WriteLine($"模型类型：{fileSet.ModelType}");
-            Console.WriteLine($"精度优先级：{fileSet.Accuracy}");
-
-            using var recognizer = CreateRecognizer(fileSet);
-
-            Console.WriteLine("模型加载完毕，输入音频文件路径开始识别，直接回车退出。");
-            RunInteractiveLoop(recognizer, fileSet);
-            return 0;
-        }
-        catch (ArgumentException ex)
-        {
-            Console.Error.WriteLine($"参数错误：{ex.Message}");
-            return 2;
-        }
-        catch (FileNotFoundException ex)
-        {
-            Console.Error.WriteLine($"文件缺失：{ex.Message}");
-            return 3;
-        }
-        catch (DirectoryNotFoundException ex)
-        {
-            Console.Error.WriteLine($"目录不存在：{ex.Message}");
-            return 4;
+            modelEntries = InitializeModels();
         }
         catch (Exception ex)
         {
-            Console.Error.WriteLine("识别失败：");
+            Console.Error.WriteLine("模型初始化失败：");
             Console.Error.WriteLine(ex);
             return 1;
         }
+
+        try
+        {
+            RunInteractiveLoop(modelEntries);
+            return 0;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine("识别过程中发生异常：");
+            Console.Error.WriteLine(ex);
+            return 1;
+        }
+        finally
+        {
+            foreach (ModelEntry entry in modelEntries)
+            {
+                entry.Recognizer.Dispose();
+            }
+        }
     }
 
-    private static void ValidateModelConfiguration()
+    private static IReadOnlyList<ModelEntry> InitializeModels()
     {
-        if (!SupportedModels.Contains(AppConfiguration.ModelType, StringComparer.OrdinalIgnoreCase))
+        List<ModelEntry> entries = new();
+        Console.WriteLine("=== 初始化模型 ===");
+        foreach (ModelConfiguration config in ModelConfigurations)
         {
-            throw new ArgumentException($"暂不支持的模型类型：{AppConfiguration.ModelType}，可选值：{string.Join(", ", SupportedModels)}");
+            try
+            {
+                if (!Directory.Exists(config.ModelDirectory))
+                {
+                    throw new DirectoryNotFoundException(config.ModelDirectory);
+                }
+
+                var fileSet = ModelFileResolver.Resolve(
+                    config.ModelDirectory,
+                    config.ModelType,
+                    config.Accuracy);
+
+                var recognizer = CreateRecognizer(fileSet, config.Threads);
+
+                bool useItn = config.EnableItn && fileSet.SupportsItn;
+                bool usePunctuation = config.EnablePunctuation && fileSet.SupportsPunctuation;
+
+                if (useItn)
+                {
+                    recognizer.ConfigureRuntimeOptions(useItn: true);
+                }
+
+                entries.Add(new ModelEntry(config, fileSet, recognizer, useItn, usePunctuation));
+                Console.WriteLine($"[OK] {config.DisplayName} ({config.ModelType}) " +
+                                  $"ITN:{(useItn ? "ON" : "OFF")} 标点:{(usePunctuation ? "ON" : "OFF")}");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[跳过] {config.DisplayName}：{ex.Message}");
+            }
         }
-        if (!Directory.Exists(AppConfiguration.ModelDirectory))
+
+        if (entries.Count == 0)
         {
-            throw new DirectoryNotFoundException(AppConfiguration.ModelDirectory);
+            throw new InvalidOperationException("未能成功加载任何模型，请检查配置路径。");
         }
+
+        Console.WriteLine();
+        return entries;
     }
 
-    private static OfflineRecognizer CreateRecognizer(ModelFileSet fileSet)
+    private static OfflineRecognizer CreateRecognizer(ModelFileSet fileSet, int threads)
     {
         return new OfflineRecognizer(
             modelFilePath: fileSet.ModelFile,
@@ -94,18 +135,67 @@ internal static class Program
             modelebFilePath: fileSet.ModelebFile ?? string.Empty,
             hotwordFilePath: fileSet.HotwordFile ?? string.Empty,
             batchSize: 1,
-            threadsNum: AppConfiguration.Threads);
+            threadsNum: threads);
     }
 
-    private static void RunInteractiveLoop(OfflineRecognizer recognizer, ModelFileSet fileSet)
+    private static void RunInteractiveLoop(IReadOnlyList<ModelEntry> modelEntries)
     {
+        while (true)
+        {
+            ModelEntry? entry = PromptModelSelection(modelEntries);
+            if (entry == null)
+            {
+                Console.WriteLine("退出程序。");
+                return;
+            }
+
+            RunRecognitionLoop(entry);
+        }
+    }
+
+    private static ModelEntry? PromptModelSelection(IReadOnlyList<ModelEntry> modelEntries)
+    {
+        Console.WriteLine("=== 可用模型 ===");
+        for (int i = 0; i < modelEntries.Count; i++)
+        {
+            ModelEntry entry = modelEntries[i];
+            Console.WriteLine($"{i + 1}. {entry.Configuration.DisplayName} ({entry.Configuration.ModelType})");
+            Console.WriteLine($"    目录：{entry.Configuration.ModelDirectory}");
+        }
+        Console.WriteLine("输入序号选择模型，直接回车退出：");
+
+        string? input = Console.ReadLine();
+        if (string.IsNullOrWhiteSpace(input))
+        {
+            return null;
+        }
+
+        if (!int.TryParse(input.Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out int index) ||
+            index < 1 || index > modelEntries.Count)
+        {
+            Console.WriteLine("无效的序号，请重试。");
+            Console.WriteLine();
+            return PromptModelSelection(modelEntries);
+        }
+
+        Console.WriteLine();
+        return modelEntries[index - 1];
+    }
+
+    private static void RunRecognitionLoop(ModelEntry entry)
+    {
+        Console.WriteLine($"已选择模型：{entry.Configuration.DisplayName}");
+        Console.WriteLine($"当前 ITN：{(entry.UseItn ? "开启" : entry.FileSet.SupportsItn ? "未开启" : "不支持")}");
+        Console.WriteLine($"当前标点：{(entry.UsePunctuation ? "开启" : entry.FileSet.SupportsPunctuation ? "未开启" : "不支持")}");
+        Console.WriteLine("输入音频文件路径开始识别，直接回车返回模型列表。");
+
         while (true)
         {
             Console.Write("音频文件> ");
             string? audioPath = Console.ReadLine();
             if (string.IsNullOrWhiteSpace(audioPath))
             {
-                Console.WriteLine("退出程序。");
+                Console.WriteLine();
                 return;
             }
 
@@ -118,45 +208,78 @@ internal static class Program
 
             try
             {
-                RunRecognition(recognizer, fileSet, audioPath);
-            }
-            catch (FileNotFoundException ex)
-            {
-                Console.WriteLine(ex.Message);
+                RunRecognition(entry, audioPath);
             }
             catch (Exception ex)
             {
                 Console.WriteLine("识别失败：");
-                Console.WriteLine(ex);
+                Console.WriteLine(ex.Message);
             }
         }
     }
 
-    private static void RunRecognition(OfflineRecognizer recognizer, ModelFileSet fileSet, string audioPath)
+    private static void RunRecognition(ModelEntry entry, string audioPath)
     {
-        ReportConfiguration(fileSet, audioPath, AppConfiguration.Threads);
-
         TimeSpan audioDuration = TimeSpan.Zero;
-        float[] samples = AudioHelper.GetFileSample(audioPath, ref audioDuration);
-        if (samples.Length == 0 || audioDuration.TotalMilliseconds <= 0)
+        float[][] channelSamples = AudioHelper.GetFileChannelSamples(audioPath, ref audioDuration);
+        if (channelSamples.Length == 0 || channelSamples.All(samples => samples.Length == 0) || audioDuration.TotalMilliseconds <= 0)
         {
             throw new InvalidOperationException("音频文件为空或无法确定时长");
         }
 
-        using var stream = recognizer.CreateOfflineStream();
+        ReportConfiguration(entry, audioPath, channelSamples.Length);
 
+        var combinedText = new StringBuilder();
+        for (int channelIndex = 0; channelIndex < channelSamples.Length; channelIndex++)
+        {
+            float[] samples = channelSamples[channelIndex];
+            if (samples.Length == 0)
+            {
+                Console.WriteLine($"--- 通道 {channelIndex + 1} ---");
+                Console.WriteLine("该通道未检测到有效音频数据，已跳过。");
+                Console.WriteLine();
+                continue;
+            }
+
+            Console.WriteLine($"--- 通道 {channelIndex + 1} ---");
+            var (result, elapsed) = RecognizeSamples(entry.Recognizer, samples);
+            PrintResult(result);
+            PrintPerformance(elapsed, audioDuration);
+            if (!string.IsNullOrWhiteSpace(result.Text))
+            {
+                if (combinedText.Length > 0)
+                {
+                    combinedText.AppendLine();
+                }
+                combinedText.Append(result.Text);
+            }
+        }
+
+        if (channelSamples.Length > 1)
+        {
+            Console.WriteLine("=== 通道合并文本 ===");
+            Console.WriteLine(combinedText.ToString().TrimEnd());
+            Console.WriteLine();
+        }
+    }
+
+    private static (OfflineRecognizerResultEntity Result, TimeSpan Elapsed) RecognizeSamples(OfflineRecognizer recognizer, float[] samples)
+    {
+        using var stream = recognizer.CreateOfflineStream();
         var watch = Stopwatch.StartNew();
         stream.AddSamples(samples);
         OfflineRecognizerResultEntity result = recognizer.GetResult(stream);
         watch.Stop();
-
-        PrintResult(result);
-        PrintPerformance(watch.Elapsed, audioDuration);
+        return (result, watch.Elapsed);
     }
 
-    private static void ReportConfiguration(ModelFileSet fileSet, string audioPath, int threads)
+    private static void ReportConfiguration(ModelEntry entry, string audioPath, int channelCount)
     {
+        ModelFileSet fileSet = entry.FileSet;
+        ModelConfiguration config = entry.Configuration;
+
         Console.WriteLine("=== 识别配置 ===");
+        Console.WriteLine($"模型名称：{config.DisplayName}");
         Console.WriteLine($"模型类型：{fileSet.ModelType}");
         Console.WriteLine($"模型目录：{fileSet.ModelDirectory}");
         Console.WriteLine($"模型文件：{fileSet.ModelFile}");
@@ -173,42 +296,45 @@ internal static class Program
         }
         Console.WriteLine($"模型精度偏好：{fileSet.Accuracy}");
         Console.WriteLine($"音频文件：{audioPath}");
-        Console.WriteLine($"线程数：{threads}");
+        Console.WriteLine($"线程数：{config.Threads}");
+        Console.WriteLine($"通道数：{channelCount}");
+
+        string itnStatus = entry.UseItn
+            ? "已启用"
+            : fileSet.SupportsItn
+                ? "未启用"
+                : "不支持";
+        string puncStatus = entry.UsePunctuation
+            ? "已启用"
+            : fileSet.SupportsPunctuation
+                ? "未启用"
+                : "不支持";
+        Console.WriteLine($"逆文本正则化 (ITN)：{itnStatus}");
+        Console.WriteLine($"标点恢复：{puncStatus}");
         Console.WriteLine();
     }
 
     private static void PrintResult(OfflineRecognizerResultEntity result)
     {
         Console.WriteLine("=== 识别结果 ===");
-        Console.WriteLine($"文本：{result.Text ?? string.Empty}");
-        Console.WriteLine($"长度：{result.TextLen}");
-        Console.WriteLine();
+        string text = result.Text ?? string.Empty;
+        string normalized = text.Replace("\r\n", "\n").Replace('\r', '\n');
+        string[] segments = normalized.Split(new[] { '\n' }, StringSplitOptions.RemoveEmptyEntries);
 
-        if (result.Tokens == null || result.Tokens.Count == 0 || result.Timestamps == null || result.Timestamps.Count == 0)
+        if (segments.Length <= 1)
         {
-            Console.WriteLine("无可用的详细时间戳信息。");
-            return;
+            Console.WriteLine($"文本：{text}");
         }
-
-        Console.WriteLine("逐词时间戳明细：");
-        Console.WriteLine($"{"#",3} {"Token",-20} {"开始 (s)",10} {"结束 (s)",10} {"时长 (ms)",12}");
-
-        int count = Math.Min(result.Tokens.Count, result.Timestamps.Count);
-        for (int i = 0; i < count; i++)
+        else
         {
-            string token = result.Tokens[i];
-            int[] stamp = result.Timestamps[i];
-            if (stamp == null || stamp.Length == 0)
+            Console.WriteLine($"段数：{segments.Length}");
+            for (int i = 0; i < segments.Length; i++)
             {
-                continue;
+                Console.WriteLine($"[{i + 1}] {segments[i].Trim()}");
             }
-            double startMs = stamp[0];
-            double endMs = stamp[stamp.Length - 1];
-            double durationMs = Math.Max(0, endMs - startMs);
-            Console.WriteLine(
-                $"{i,3} {token,-20} {startMs / 1000.0,10:F3} {endMs / 1000.0,10:F3} {durationMs,12:F1}");
         }
 
+        Console.WriteLine($"长度：{result.TextLen}");
         Console.WriteLine();
     }
 
@@ -222,6 +348,23 @@ internal static class Program
         Console.WriteLine($"实时率 (RTF)：{rtf.ToString("F3", CultureInfo.InvariantCulture)}x");
     }
 
+    private sealed record ModelConfiguration(
+        string Key,
+        string DisplayName,
+        string ModelType,
+        string ModelDirectory,
+        string Accuracy,
+        int Threads,
+        bool EnableItn = false,
+        bool EnablePunctuation = false);
+
+    private sealed record ModelEntry(
+        ModelConfiguration Configuration,
+        ModelFileSet FileSet,
+        OfflineRecognizer Recognizer,
+        bool UseItn,
+        bool UsePunctuation);
+
     private sealed record ModelFileSet(
         string ModelType,
         string ModelDirectory,
@@ -231,7 +374,9 @@ internal static class Program
         string MvnFile,
         string TokensFile,
         string? ModelebFile,
-        string? HotwordFile);
+        string? HotwordFile,
+        bool SupportsItn,
+        bool SupportsPunctuation);
 
     private sealed class ModelFileResolver
     {
@@ -286,6 +431,38 @@ internal static class Program
                     file.Extension.Equals(".txt", StringComparison.OrdinalIgnoreCase));
             }
 
+            bool supportsItn = false;
+            bool supportsPunctuation = false;
+            if (!string.IsNullOrEmpty(configFile) && File.Exists(configFile))
+            {
+                try
+                {
+                    string configContent = File.ReadAllText(configFile);
+                    supportsItn = configContent.IndexOf("use_itn", StringComparison.OrdinalIgnoreCase) >= 0;
+                }
+                catch
+                {
+                    // ignore parsing issues
+                }
+            }
+
+            if (modelType.Equals("sensevoicesmall", StringComparison.OrdinalIgnoreCase))
+            {
+                supportsItn = true;
+                supportsPunctuation = true;
+            }
+            else
+            {
+                try
+                {
+                    supportsPunctuation = Directory.EnumerateFiles(modelDirectory, "*punc*", SearchOption.TopDirectoryOnly).Any();
+                }
+                catch
+                {
+                    supportsPunctuation = false;
+                }
+            }
+
             return new ModelFileSet(
                 ModelType: modelType,
                 ModelDirectory: modelDirectory,
@@ -295,7 +472,9 @@ internal static class Program
                 MvnFile: mvnFile,
                 TokensFile: tokensFile,
                 ModelebFile: modelebFile,
-                HotwordFile: hotwordFile);
+                HotwordFile: hotwordFile,
+                SupportsItn: supportsItn,
+                SupportsPunctuation: supportsPunctuation);
         }
 
         private static string RequireFile(

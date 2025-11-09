@@ -99,6 +99,18 @@ namespace ManySpeech.AliParaformerAsr
             return offlineStream;
         }
 
+        public void ConfigureRuntimeOptions(bool? useItn = null)
+        {
+            if (useItn.HasValue)
+            {
+                _offlineModel.Use_itn = useItn.Value;
+                if (_confEntity != null)
+                {
+                    _confEntity.use_itn = useItn.Value;
+                }
+            }
+        }
+
         public OfflineRecognizerResultEntity GetResult(OfflineStream stream)
         {
             List<OfflineStream> streams = new List<OfflineStream>();
