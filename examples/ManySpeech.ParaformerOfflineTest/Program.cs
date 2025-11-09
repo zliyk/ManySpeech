@@ -21,7 +21,7 @@ internal static class Program
             ModelType: "paraformer",
             ModelDirectory: "/ModelFiles/ASR/paraformer-large-zh-en-onnx-offline",
             Accuracy: "int8",
-            Threads: 2,
+            Threads: 16,
             EnableItn: false,
             EnablePunctuation: false),
         new(
@@ -30,7 +30,7 @@ internal static class Program
             ModelType: "sensevoicesmall",
             ModelDirectory: "/ModelFiles/ASR/sensevoice-small-onnx",
             Accuracy: "int8",
-            Threads: 2,
+            Threads: 16,
             EnableItn: true,
             EnablePunctuation: true),
         new(
@@ -39,7 +39,7 @@ internal static class Program
             ModelType: "seacoparaformer",
             ModelDirectory: "/ModelFiles/ASR/paraformer-seaco-large-zh-timestamp-onnx-offline",
             Accuracy: "int8",
-            Threads: 2,
+            Threads: 16,
             EnableItn: false,
             EnablePunctuation: false)
     };
@@ -318,25 +318,222 @@ internal static class Program
     {
         Console.WriteLine("=== 识别结果 ===");
         string text = result.Text ?? string.Empty;
-        string normalized = text.Replace("\r\n", "\n").Replace('\r', '\n');
-        string[] segments = normalized.Split(new[] { '\n' }, StringSplitOptions.RemoveEmptyEntries);
+        Console.WriteLine($"文本：{text}");
+        Console.WriteLine($"长度：{result.TextLen}");
+        Console.WriteLine();
 
-        if (segments.Length <= 1)
+        if (!HasValidTimestamps(result) || result.Tokens == null || result.Timestamps == null)
         {
-            Console.WriteLine($"文本：{text}");
+            Console.WriteLine("该模型未提供有效的时间戳信息，已跳过逐词与分段明细。");
+            Console.WriteLine();
+            return;
         }
-        else
+
+        Console.WriteLine("逐词时间戳：");
+        Console.WriteLine($"{"#",3} {"Token",-20} {"开始 (s)",10} {"结束 (s)",10} {"时长 (ms)",12}");
+        int count = Math.Min(result.Tokens.Count, result.Timestamps.Count);
+        for (int i = 0; i < count; i++)
         {
-            Console.WriteLine($"段数：{segments.Length}");
-            for (int i = 0; i < segments.Length; i++)
+            string token = result.Tokens[i];
+            int[] stamp = result.Timestamps[i];
+            if (stamp == null || stamp.Length == 0)
             {
-                Console.WriteLine($"[{i + 1}] {segments[i].Trim()}");
+                continue;
+            }
+            double startMs = stamp.FirstOrDefault();
+            double endMs = stamp.LastOrDefault();
+            double duration = Math.Max(0, endMs - startMs);
+            Console.WriteLine($"{i + 1,3} {token,-20} {startMs / 1000.0,10:F3} {endMs / 1000.0,10:F3} {duration,12:F1}");
+        }
+        Console.WriteLine();
+
+        var segments = BuildSegments(result);
+        if (segments.Count > 0)
+        {
+            Console.WriteLine("分段结果：");
+            Console.WriteLine($"{"#",3} {"起始 (s)",10} {"结束 (s)",10} {"时长 (s)",10} 片段文本");
+            for (int i = 0; i < segments.Count; i++)
+            {
+                var segment = segments[i];
+                Console.WriteLine(
+                    $"{i + 1,3} {segment.StartSeconds,10:F3} {segment.EndSeconds,10:F3} {(segment.EndSeconds - segment.StartSeconds),10:F3} {segment.Text}");
+            }
+            Console.WriteLine();
+        }
+    }
+
+    private static List<RecognitionSegment> BuildSegments(OfflineRecognizerResultEntity result)
+    {
+        if (!HasValidTimestamps(result))
+        {
+            return new List<RecognitionSegment>();
+        }
+
+        var segments = new List<RecognitionSegment>();
+        if (result.Tokens == null || result.Timestamps == null)
+        {
+            return segments;
+        }
+
+        const double gapThresholdMs = 1500.0;
+        double currentStart = -1;
+        double currentEnd = -1;
+        var buffer = new StringBuilder();
+
+        int count = Math.Min(result.Tokens.Count, result.Timestamps.Count);
+        for (int i = 0; i < count; i++)
+        {
+            string token = result.Tokens[i];
+            int[] stamp = result.Timestamps[i];
+            if (stamp == null || stamp.Length == 0 || string.IsNullOrWhiteSpace(token))
+            {
+                continue;
+            }
+
+            double tokenStart = stamp.FirstOrDefault();
+            double tokenEnd = stamp.LastOrDefault();
+
+            if (currentStart < 0)
+            {
+                currentStart = tokenStart;
+            }
+
+            if (currentEnd >= 0 && tokenStart - currentEnd >= gapThresholdMs && buffer.Length > 0)
+            {
+                segments.Add(CreateSegment(buffer, currentStart, currentEnd));
+                buffer.Clear();
+                currentStart = tokenStart;
+            }
+
+            AppendToken(buffer, token);
+            currentEnd = Math.Max(currentEnd, tokenEnd);
+
+            if (IsSentenceEndingToken(token))
+            {
+                segments.Add(CreateSegment(buffer, currentStart, currentEnd));
+                buffer.Clear();
+                currentStart = -1;
+                currentEnd = -1;
             }
         }
 
-        Console.WriteLine($"长度：{result.TextLen}");
-        Console.WriteLine();
+        if (buffer.Length > 0 && currentStart >= 0)
+        {
+            segments.Add(CreateSegment(buffer, currentStart, currentEnd));
+        }
+
+        return segments;
     }
+
+    private static RecognitionSegment CreateSegment(StringBuilder buffer, double startMs, double endMs)
+    {
+        string text = buffer.ToString().Trim();
+        return new RecognitionSegment(
+            Text: text,
+            StartSeconds: startMs / 1000.0,
+            EndSeconds: Math.Max(startMs, endMs) / 1000.0);
+    }
+
+    private static void AppendToken(StringBuilder buffer, string token)
+    {
+        if (buffer.Length > 0 && NeedsSpace(buffer[buffer.Length - 1], token))
+        {
+            buffer.Append(' ');
+        }
+        buffer.Append(token);
+    }
+
+    private static bool NeedsSpace(char previousChar, string token)
+    {
+        if (string.IsNullOrEmpty(token))
+        {
+            return false;
+        }
+
+        if (IsCjkText(token))
+        {
+            return false;
+        }
+
+        const string punctuation = "，。,．.？！?!；;：:、,，.。！？!?";
+        char lastChar = token[^1];
+        if (punctuation.Contains(lastChar))
+        {
+            return false;
+        }
+
+        if (char.IsLetterOrDigit(token[0]))
+        {
+            return !(char.IsWhiteSpace(previousChar) || punctuation.Contains(previousChar));
+        }
+
+        return false;
+    }
+
+    private static bool IsSentenceEndingToken(string token)
+    {
+        if (string.IsNullOrEmpty(token))
+        {
+            return false;
+        }
+
+        return token.Trim() switch
+        {
+            "。" or "！" or "？" or "…" or "?" or "!" or "." or "；" or ";" => true,
+            _ => false,
+        };
+    }
+
+    private static bool IsCjkText(string token)
+    {
+        foreach (char c in token)
+        {
+            if (!IsCjkCharacter(c))
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static bool IsCjkCharacter(char c)
+    {
+        return (c >= 0x4E00 && c <= 0x9FFF)   // CJK Unified Ideographs
+            || (c >= 0x3400 && c <= 0x4DBF)   // CJK Unified Ideographs Extension A
+            || (c >= 0x20000 && c <= 0x2A6DF) // Extension B
+            || (c >= 0x2A700 && c <= 0x2B73F) // Extension C
+            || (c >= 0x2B740 && c <= 0x2B81F) // Extension D
+            || (c >= 0x2B820 && c <= 0x2CEAF) // Extension E-F
+            || (c >= 0xF900 && c <= 0xFAFF);  // CJK Compatibility Ideographs
+    }
+
+    private static bool HasValidTimestamps(OfflineRecognizerResultEntity result)
+    {
+        if (result.Timestamps == null || result.Timestamps.Count == 0)
+        {
+            return false;
+        }
+
+        foreach (var stamp in result.Timestamps)
+        {
+            if (stamp == null)
+            {
+                continue;
+            }
+            for (int i = 0; i < stamp.Length; i++)
+            {
+                if (stamp[i] > 0)
+                {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    private sealed record RecognitionSegment(string Text, double StartSeconds, double EndSeconds);
+
 
     private static void PrintPerformance(TimeSpan elapsed, TimeSpan audioDuration)
     {
