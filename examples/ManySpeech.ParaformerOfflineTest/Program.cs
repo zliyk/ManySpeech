@@ -12,6 +12,14 @@ namespace ManySpeech.ParaformerOfflineTest;
 
 internal static class Program
 {
+    private static class AppConfiguration
+    {
+        public const string ModelType = "paraformer";
+        public const string ModelDirectory = "/ModelFiles/ASR/paraformer-large-zh-en-onnx-offline";
+        public const string Accuracy = "int8";
+        public const int Threads = 2;
+    }
+
     private static readonly string[] SupportedModels = new[]
     {
         "paraformer",
@@ -23,17 +31,27 @@ internal static class Program
     {
         try
         {
-            var options = RecognitionOptions.Parse(args);
-            ValidateOptions(options);
-            var fileSet = ModelFileResolver.Resolve(options);
-            ReportConfiguration(options, fileSet);
-            RunRecognition(options, fileSet);
+            ValidateModelConfiguration();
+
+            var fileSet = ModelFileResolver.Resolve(
+                AppConfiguration.ModelDirectory,
+                AppConfiguration.ModelType,
+                AppConfiguration.Accuracy);
+
+            Console.WriteLine("=== 模型初始化 ===");
+            Console.WriteLine($"模型目录：{fileSet.ModelDirectory}");
+            Console.WriteLine($"模型类型：{fileSet.ModelType}");
+            Console.WriteLine($"精度优先级：{fileSet.Accuracy}");
+
+            using var recognizer = CreateRecognizer(fileSet);
+
+            Console.WriteLine("模型加载完毕，输入音频文件路径开始识别，直接回车退出。");
+            RunInteractiveLoop(recognizer, fileSet);
             return 0;
         }
         catch (ArgumentException ex)
         {
             Console.Error.WriteLine($"参数错误：{ex.Message}");
-            RecognitionOptions.PrintUsage();
             return 2;
         }
         catch (FileNotFoundException ex)
@@ -54,27 +72,93 @@ internal static class Program
         }
     }
 
-    private static void ValidateOptions(RecognitionOptions options)
+    private static void ValidateModelConfiguration()
     {
-        if (!SupportedModels.Contains(options.ModelType, StringComparer.OrdinalIgnoreCase))
+        if (!SupportedModels.Contains(AppConfiguration.ModelType, StringComparer.OrdinalIgnoreCase))
         {
-            throw new ArgumentException($"暂不支持的模型类型：{options.ModelType}，可选值：{string.Join(", ", SupportedModels)}");
+            throw new ArgumentException($"暂不支持的模型类型：{AppConfiguration.ModelType}，可选值：{string.Join(", ", SupportedModels)}");
         }
-        if (!Directory.Exists(options.ModelDirectory))
+        if (!Directory.Exists(AppConfiguration.ModelDirectory))
         {
-            throw new DirectoryNotFoundException(options.ModelDirectory);
-        }
-        if (!File.Exists(options.AudioPath))
-        {
-            throw new FileNotFoundException("音频文件不存在", options.AudioPath);
+            throw new DirectoryNotFoundException(AppConfiguration.ModelDirectory);
         }
     }
 
-    private static void ReportConfiguration(RecognitionOptions options, ModelFileSet fileSet)
+    private static OfflineRecognizer CreateRecognizer(ModelFileSet fileSet)
+    {
+        return new OfflineRecognizer(
+            modelFilePath: fileSet.ModelFile,
+            configFilePath: fileSet.ConfigFile,
+            mvnFilePath: fileSet.MvnFile,
+            tokensFilePath: fileSet.TokensFile,
+            modelebFilePath: fileSet.ModelebFile ?? string.Empty,
+            hotwordFilePath: fileSet.HotwordFile ?? string.Empty,
+            batchSize: 1,
+            threadsNum: AppConfiguration.Threads);
+    }
+
+    private static void RunInteractiveLoop(OfflineRecognizer recognizer, ModelFileSet fileSet)
+    {
+        while (true)
+        {
+            Console.Write("音频文件> ");
+            string? audioPath = Console.ReadLine();
+            if (string.IsNullOrWhiteSpace(audioPath))
+            {
+                Console.WriteLine("退出程序。");
+                return;
+            }
+
+            audioPath = audioPath.Trim();
+            if (!File.Exists(audioPath))
+            {
+                Console.WriteLine("文件不存在，请重新输入。");
+                continue;
+            }
+
+            try
+            {
+                RunRecognition(recognizer, fileSet, audioPath);
+            }
+            catch (FileNotFoundException ex)
+            {
+                Console.WriteLine(ex.Message);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine("识别失败：");
+                Console.WriteLine(ex);
+            }
+        }
+    }
+
+    private static void RunRecognition(OfflineRecognizer recognizer, ModelFileSet fileSet, string audioPath)
+    {
+        ReportConfiguration(fileSet, audioPath, AppConfiguration.Threads);
+
+        TimeSpan audioDuration = TimeSpan.Zero;
+        float[] samples = AudioHelper.GetFileSample(audioPath, ref audioDuration);
+        if (samples.Length == 0 || audioDuration.TotalMilliseconds <= 0)
+        {
+            throw new InvalidOperationException("音频文件为空或无法确定时长");
+        }
+
+        using var stream = recognizer.CreateOfflineStream();
+
+        var watch = Stopwatch.StartNew();
+        stream.AddSamples(samples);
+        OfflineRecognizerResultEntity result = recognizer.GetResult(stream);
+        watch.Stop();
+
+        PrintResult(result);
+        PrintPerformance(watch.Elapsed, audioDuration);
+    }
+
+    private static void ReportConfiguration(ModelFileSet fileSet, string audioPath, int threads)
     {
         Console.WriteLine("=== 识别配置 ===");
-        Console.WriteLine($"模型类型：{options.ModelType}");
-        Console.WriteLine($"模型目录：{options.ModelDirectory}");
+        Console.WriteLine($"模型类型：{fileSet.ModelType}");
+        Console.WriteLine($"模型目录：{fileSet.ModelDirectory}");
         Console.WriteLine($"模型文件：{fileSet.ModelFile}");
         Console.WriteLine($"配置文件：{fileSet.ConfigFile}");
         Console.WriteLine($"MVN 文件：{fileSet.MvnFile}");
@@ -87,39 +171,10 @@ internal static class Program
         {
             Console.WriteLine($"热词文件：{fileSet.HotwordFile}");
         }
-        Console.WriteLine($"音频文件：{options.AudioPath}");
-        Console.WriteLine($"线程数：{options.Threads}");
+        Console.WriteLine($"模型精度偏好：{fileSet.Accuracy}");
+        Console.WriteLine($"音频文件：{audioPath}");
+        Console.WriteLine($"线程数：{threads}");
         Console.WriteLine();
-    }
-
-    private static void RunRecognition(RecognitionOptions options, ModelFileSet fileSet)
-    {
-        TimeSpan audioDuration = TimeSpan.Zero;
-        float[] samples = AudioHelper.GetFileSample(options.AudioPath, ref audioDuration);
-        if (samples.Length == 0 || audioDuration.TotalMilliseconds <= 0)
-        {
-            throw new InvalidOperationException("音频文件为空或无法确定时长");
-        }
-
-        using var recognizer = new OfflineRecognizer(
-            modelFilePath: fileSet.ModelFile,
-            configFilePath: fileSet.ConfigFile,
-            mvnFilePath: fileSet.MvnFile,
-            tokensFilePath: fileSet.TokensFile,
-            modelebFilePath: fileSet.ModelebFile ?? string.Empty,
-            hotwordFilePath: fileSet.HotwordFile ?? string.Empty,
-            batchSize: 1,
-            threadsNum: options.Threads);
-
-        using var stream = recognizer.CreateOfflineStream();
-
-        var watch = Stopwatch.StartNew();
-        stream.AddSamples(samples);
-        OfflineRecognizerResultEntity result = recognizer.GetResult(stream);
-        watch.Stop();
-
-        PrintResult(result);
-        PrintPerformance(watch.Elapsed, audioDuration);
     }
 
     private static void PrintResult(OfflineRecognizerResultEntity result)
@@ -168,6 +223,9 @@ internal static class Program
     }
 
     private sealed record ModelFileSet(
+        string ModelType,
+        string ModelDirectory,
+        string Accuracy,
         string ModelFile,
         string ConfigFile,
         string MvnFile,
@@ -177,14 +235,17 @@ internal static class Program
 
     private sealed class ModelFileResolver
     {
-        public static ModelFileSet Resolve(RecognitionOptions options)
+        public static ModelFileSet Resolve(string modelDirectory, string modelType, string? accuracy)
         {
-            if (!Directory.Exists(options.ModelDirectory))
+            if (!Directory.Exists(modelDirectory))
             {
-                throw new DirectoryNotFoundException(options.ModelDirectory);
+                throw new DirectoryNotFoundException(modelDirectory);
             }
 
-            var files = Directory.GetFiles(options.ModelDirectory, "*", SearchOption.TopDirectoryOnly)
+            string? accuracyNormalized = string.IsNullOrWhiteSpace(accuracy) ? null : accuracy.Trim();
+            bool isSeaco = modelType.Equals("seacoparaformer", StringComparison.OrdinalIgnoreCase);
+
+            var files = Directory.GetFiles(modelDirectory, "*", SearchOption.TopDirectoryOnly)
                 .Select(path => new FileInfo(path))
                 .ToList();
 
@@ -192,15 +253,15 @@ internal static class Program
                     file.Name.StartsWith("model", StringComparison.OrdinalIgnoreCase) &&
                     !file.Name.Contains("_eb", StringComparison.OrdinalIgnoreCase) &&
                     file.Extension.Equals(".onnx", StringComparison.OrdinalIgnoreCase),
-                options.Accuracy);
+                accuracyNormalized);
 
             string? modelebFile = null;
-            if (options.ModelType.Equals("seacoparaformer", StringComparison.OrdinalIgnoreCase))
+            if (isSeaco)
             {
                 modelebFile = RequireFile("热词 Embed ONNX", files,
                     file => file.Name.StartsWith("model_eb", StringComparison.OrdinalIgnoreCase) &&
                             file.Extension.Equals(".onnx", StringComparison.OrdinalIgnoreCase),
-                    options.Accuracy);
+                    accuracyNormalized);
             }
 
             string configFile = RequireFile("配置文件 (asr.yaml/json)", files, file =>
@@ -217,19 +278,24 @@ internal static class Program
                 file.Name.StartsWith("tokens", StringComparison.OrdinalIgnoreCase) &&
                 file.Extension.Equals(".txt", StringComparison.OrdinalIgnoreCase));
 
-            string? hotwordFile = FindFile(files, file =>
-                file.Name.StartsWith("hotword", StringComparison.OrdinalIgnoreCase) &&
-                file.Extension.Equals(".txt", StringComparison.OrdinalIgnoreCase));
+            string? hotwordFile = null;
+            if (isSeaco)
+            {
+                hotwordFile = FindFile(files, file =>
+                    file.Name.StartsWith("hotword", StringComparison.OrdinalIgnoreCase) &&
+                    file.Extension.Equals(".txt", StringComparison.OrdinalIgnoreCase));
+            }
 
             return new ModelFileSet(
+                ModelType: modelType,
+                ModelDirectory: modelDirectory,
+                Accuracy: accuracyNormalized ?? string.Empty,
                 ModelFile: modelFile,
                 ConfigFile: configFile,
                 MvnFile: mvnFile,
                 TokensFile: tokensFile,
                 ModelebFile: modelebFile,
-                HotwordFile: options.ModelType.Equals("seacoparaformer", StringComparison.OrdinalIgnoreCase)
-                    ? hotwordFile
-                    : null);
+                HotwordFile: hotwordFile);
         }
 
         private static string RequireFile(
@@ -267,99 +333,6 @@ internal static class Program
                 }
             }
             return candidates.Last().FullName;
-        }
-    }
-
-    private sealed class RecognitionOptions
-    {
-        private RecognitionOptions(
-            string modelType,
-            string modelDirectory,
-            string audioPath,
-            string accuracy,
-            int threads)
-        {
-            ModelType = modelType;
-            ModelDirectory = modelDirectory;
-            AudioPath = audioPath;
-            Accuracy = accuracy;
-            Threads = threads;
-        }
-
-        public string ModelType { get; }
-        public string ModelDirectory { get; }
-        public string AudioPath { get; }
-        public string Accuracy { get; }
-        public int Threads { get; }
-
-        public static RecognitionOptions Parse(string[] args)
-        {
-            if (args.Length == 0)
-            {
-                throw new ArgumentException("未提供任何参数。");
-            }
-
-            var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-            for (int i = 0; i < args.Length; i++)
-            {
-                string arg = args[i];
-                if (arg.StartsWith("--", StringComparison.Ordinal))
-                {
-                    string key = arg;
-                    if (i + 1 >= args.Length || args[i + 1].StartsWith("--", StringComparison.Ordinal))
-                    {
-                        throw new ArgumentException($"参数 {key} 缺少取值。");
-                    }
-                    map[key] = args[++i];
-                }
-            }
-
-            if (!map.TryGetValue("--model", out string? modelType))
-            {
-                throw new ArgumentException("必须指定 --model");
-            }
-            if (!map.TryGetValue("--model-dir", out string? modelDir))
-            {
-                throw new ArgumentException("必须指定 --model-dir");
-            }
-            if (!map.TryGetValue("--audio", out string? audio))
-            {
-                throw new ArgumentException("必须指定 --audio");
-            }
-
-            map.TryGetValue("--accuracy", out string? accuracy);
-            map.TryGetValue("--threads", out string? threadsValue);
-
-            int threads = 2;
-            if (!string.IsNullOrWhiteSpace(threadsValue) &&
-                !int.TryParse(threadsValue, NumberStyles.Integer, CultureInfo.InvariantCulture, out threads))
-            {
-                throw new ArgumentException("--threads 需要整数");
-            }
-
-            accuracy ??= "int8";
-
-            return new RecognitionOptions(
-                modelType: modelType.Trim(),
-                modelDirectory: modelDir.Trim(),
-                audioPath: audio.Trim(),
-                accuracy: accuracy.Trim(),
-                threads: Math.Max(1, threads));
-        }
-
-        public static void PrintUsage()
-        {
-            Console.WriteLine();
-            Console.WriteLine("用法：");
-            Console.WriteLine("  dotnet run --project examples/ManySpeech.ParaformerOfflineTest -- " +
-                              "--model paraformer|sensevoicesmall|seacoparaformer " +
-                              "--model-dir <模型目录> --audio <音频文件> [--accuracy int8] [--threads 2]");
-            Console.WriteLine();
-            Console.WriteLine("示例：");
-            Console.WriteLine("  dotnet run --project examples/ManySpeech.ParaformerOfflineTest -- " +
-                              "--model seacoparaformer --model-dir D:/models/seaco --audio sample.wav " +
-                              "--accuracy int8 --threads 4");
-            Console.WriteLine();
         }
     }
 }
